@@ -3866,7 +3866,7 @@ int next_init( void * context, next_config_t * config_in )
         config.socket_receive_buffer_size = config_in->socket_receive_buffer_size;
     }
 
-    config.disable_network_next = config_in ? config_in->disable_network_next : false;
+    config.disable_network_next = config_in ? config_in->disable_network_next != 0 : false;
 
     const char * next_disable_network_next_override = next_platform_getenv( "NEXT_DISABLE_NETWORK_NEXT" );
     {
@@ -3885,7 +3885,7 @@ int next_init( void * context, next_config_t * config_in )
         next_printf( NEXT_LOG_LEVEL_INFO, "network next is disabled" );
     }
 
-    config.disable_autodetect = config_in ? config_in->disable_autodetect : false;
+    config.disable_autodetect = config_in ? config_in->disable_autodetect != 0 : false;
 
     const char * next_disable_autodetect_override = next_platform_getenv( "NEXT_DISABLE_AUTODETECT" );
     {
@@ -5509,9 +5509,14 @@ bool next_route_manager_committed( next_route_manager_t * route_manager )
     return route_manager->route_data.current_route && route_manager->route_data.current_route_committed;
 }
 
-void next_route_manager_prepare_send_packet( next_route_manager_t * route_manager, uint64_t sequence, next_address_t * to, const uint8_t * payload_data, int payload_bytes, uint8_t * packet_data, int * packet_bytes )
+bool next_route_manager_prepare_send_packet( next_route_manager_t * route_manager, uint64_t sequence, next_address_t * to, const uint8_t * payload_data, int payload_bytes, uint8_t * packet_data, int * packet_bytes )
 {
     next_route_manager_verify_sentinels( route_manager );
+
+    if ( !route_manager->route_data.current_route )
+    {
+    	return false;
+    }
 
     next_assert( route_manager->route_data.current_route );
     next_assert( to );
@@ -5526,12 +5531,14 @@ void next_route_manager_prepare_send_packet( next_route_manager_t * route_manage
     if ( next_write_header( NEXT_DIRECTION_CLIENT_TO_SERVER, NEXT_CLIENT_TO_SERVER_PACKET, sequence, route_manager->route_data.current_route_session_id, route_manager->route_data.current_route_session_version, route_manager->route_data.current_route_private_key, packet_data ) != NEXT_OK )
     {
         next_printf( NEXT_LOG_LEVEL_ERROR, "client failed to write client to server packet header" );
-        return;
+        return false;
     }
 
     memcpy( packet_data + NEXT_HEADER_BYTES, payload_data, payload_bytes );
 
     *packet_bytes = NEXT_HEADER_BYTES + payload_bytes;
+
+    return true;
 }
 
 bool next_route_manager_process_server_to_client_packet( next_route_manager_t * route_manager, const next_address_t * from, uint8_t * packet_data, int packet_bytes, uint64_t * payload_sequence )
@@ -7169,7 +7176,7 @@ void next_client_internal_update_stats( next_client_internal_t * client )
         packet.reported = client->reported;
         packet.fallback_to_direct = client->fallback_to_direct;
         packet.multipath = client->multipath;
-        packet.committed = client->client_stats.committed;
+        packet.committed = client->client_stats.committed != 0;
         packet.platform_id = client->client_stats.platform_id;
         packet.connection_type = client->client_stats.connection_type;
 
@@ -7186,8 +7193,8 @@ void next_client_internal_update_stats( next_client_internal_t * client )
             packet.next_kbps_down = 0;
         }
 
-        packet.next = client->client_stats.next;
-        packet.committed = client->client_stats.committed;
+        packet.next = client->client_stats.next != 0;
+        packet.committed = client->client_stats.committed != 0;
         packet.next_rtt = client->client_stats.next_rtt;
         packet.next_jitter = client->client_stats.next_jitter;
         packet.next_packet_loss = client->client_stats.next_packet_loss;
@@ -7869,7 +7876,7 @@ void next_client_send_packet( next_client_t * client, const uint8_t * packet_dat
         bool send_direct = !send_over_network_next;
         next_platform_mutex_release( &client->internal->route_manager_mutex );
 
-        bool multipath = client->client_stats.multipath;
+        bool multipath = client->client_stats.multipath != 0;
 
         if ( send_over_network_next && multipath )
         {
@@ -7922,12 +7929,18 @@ void next_client_send_packet( next_client_t * client, const uint8_t * packet_dat
             uint8_t next_packet_data[NEXT_MAX_PACKET_BYTES];
 
             next_platform_mutex_acquire( &client->internal->route_manager_mutex );
-            next_route_manager_prepare_send_packet( client->internal->route_manager, send_sequence, &next_to, packet_data, packet_bytes, next_packet_data, &next_packet_bytes );
+            bool result = next_route_manager_prepare_send_packet( client->internal->route_manager, send_sequence, &next_to, packet_data, packet_bytes, next_packet_data, &next_packet_bytes );
             next_platform_mutex_release( &client->internal->route_manager_mutex );
 
-            next_platform_socket_send_packet( client->internal->socket, &next_to, next_packet_data, next_packet_bytes );
-
-            client->counters[NEXT_CLIENT_COUNTER_PACKET_SENT_NEXT]++;
+            if ( result )
+            {
+	            next_platform_socket_send_packet( client->internal->socket, &next_to, next_packet_data, next_packet_bytes );
+	            client->counters[NEXT_CLIENT_COUNTER_PACKET_SENT_NEXT]++;
+            }
+            else
+            {
+            	send_direct = true;
+            }
         }
 
         if ( send_direct )
@@ -9428,7 +9441,7 @@ struct next_session_entry_t
     NEXT_DECLARE_SENTINEL(29)
 
     uint32_t session_flush_update_sequence;
-	bool session_update_flush;
+    bool session_update_flush;
     bool session_update_flush_finished;
     bool match_data_flush;
     bool match_data_flush_finished;
@@ -10935,13 +10948,13 @@ bool next_autodetect_multiplay( const char * input_datacenter, const char * addr
 	    char * whois_output = &whois_buffer[0];
 	    size_t bytes_remaining = sizeof(whois_buffer) - 1;
 	    next_whois( address, ANICHOST, 1, &whois_output, bytes_remaining );
-   		FILE * f = fopen( "whois.txt", "w" );
-   		if ( f )
+   		FILE * whois_file = fopen( "whois.txt", "w" );
+   		if ( whois_file )
    		{
    			next_printf( NEXT_LOG_LEVEL_INFO, "server cached whois result to whois.txt" );
-   			fputs( whois_buffer, f );
-   			fflush( f );
-   			fclose( f );
+   			fputs( whois_buffer, whois_file );
+   			fflush( whois_file );
+   			fclose( whois_file );
    		}
 	}
 
@@ -12051,7 +12064,7 @@ void next_server_internal_process_network_next_packet( next_server_internal_t * 
                 entry->previous_server_events = 0;
             }
 
-            if ( entry->session_update_flush && entry->session_update_packet.client_ping_timed_out && packet.slice_number == entry->session_flush_update_sequence - 1 )
+            if ( entry->session_update_flush && entry->session_update_packet.client_ping_timed_out  && packet.slice_number == entry->session_flush_update_sequence - 1 )
             {
                 next_printf( NEXT_LOG_LEVEL_DEBUG, "server flushed session update for session %" PRIx64 " to backend", entry->session_id );
                 entry->session_update_flush_finished = true;
